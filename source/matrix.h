@@ -19,7 +19,7 @@ extern led_t ledSticky[KEY_COUNT];
 
 /* In case we switched to a new profile, the mainCallback should call the
  * profile handler initially when this flag is set to true. */
-extern bool needToCallbackProfile;
+extern volatile bool needToCallbackProfile;
 
 /* Animations */
 /* If non-zero the animation is enabled; 1 is full speed */
@@ -37,6 +37,10 @@ extern bool foregroundColorSet;
 extern uint32_t foregroundColor;
 
 void matrixInit(void);
+
+/* Recompute the per channel factor after changing color_correction or
+ * color_temperature. Called by matrixInit. */
+void matrixUpdateColorAdjust(void);
 void matrixEnable(void);
 void matrixDisable(void);
 

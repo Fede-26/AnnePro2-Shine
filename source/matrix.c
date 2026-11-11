@@ -1,6 +1,7 @@
 /* Algorithm controlling the LEDs. */
 
 #include "matrix.h"
+#include "ch.h"
 #include "board.h"
 #include "hal.h"
 #include "settings.h"
@@ -12,7 +13,7 @@ led_t ledSticky[KEY_COUNT];
 
 led_t noColor = {.p.red = 0, .p.green = 0, .p.blue = 0, .p.alpha = 0};
 
-bool needToCallbackProfile = false;
+volatile bool needToCallbackProfile = false;
 bool matrixEnabled;
 
 /* Animations */
@@ -23,7 +24,6 @@ volatile uint16_t animationSkipTicks = 0;
 uint16_t animationTicks = 0;
 
 /* Internal function prototypes */
-static void animationCallback(void);
 static void mainCallback(GPTDriver *_driver);
 static void pwmRowDimmer(void);
 static void pwmNextColumn(void);
@@ -47,6 +47,13 @@ const ioline_t ledRows[NUM_ROW * 3] = {
 };
 
 static mutex_t mtx;
+
+/*
+ * Profile callbacks run here rather than in the PWM interrupt. NORMALPRIO
+ * keeps them below the thread draining the UART in main().
+ */
+static THD_WORKING_AREA(waAnimation, 384);
+static binary_semaphore_t animationSem;
 
 /*
   Original firmware reference:
@@ -94,6 +101,31 @@ uint16_t pwmCounter;
  */
 const uint16_t pwmCounterLimit = 80;
 
+/*
+ * Per channel scaling factor folded out of color_correction and
+ * color_temperature, indexed like led_t.pv (0 - blue, 1 - green, 2 - red).
+ *
+ * Both inputs are configuration, so the factor only changes when they do.
+ * It used to be recomputed for all 15 channels of every column, which is
+ * ~15k divisions per second inside the PWM interrupt - and this core has no
+ * divide instruction, so each one is a call into __aeabi_uidiv.
+ */
+static uint8_t colorAdjust[3] = {0xFF, 0xFF, 0xFF};
+
+void matrixUpdateColorAdjust(void) {
+  for (size_t i = 0; i < 3; i++) {
+    const uint8_t cc = color_correction.pv[i];
+    const uint8_t ct = color_temperature.pv[i];
+    if (cc > 0 && ct > 0) {
+      uint32_t work = (((uint32_t)cc) + 1) * (((uint32_t)ct) + 1) * 0xFF;
+      work /= 0x10000L;
+      colorAdjust[i] = work & 0xFF;
+    } else {
+      colorAdjust[i] = 0xFF;
+    }
+  }
+}
+
 /* Disable timeouted LEDs */
 static inline void pwmRowDimmer() {
   for (size_t ledRow = 0; ledRow < NUM_ROW * 3; ledRow++) {
@@ -114,7 +146,10 @@ static inline void pwmNextColumn() {
   /* Disable previously lit column */
   palClearLine(ledColumns[currentColumn]);
 
-  currentColumn = (currentColumn + 1) % NUM_COLUMN;
+  /* Not "% NUM_COLUMN": 14 is not a power of two, so that compiled into a
+   * call to __aeabi_idivmod on every column cycle. */
+  if (++currentColumn >= NUM_COLUMN)
+    currentColumn = 0;
 
   /* Prepare the PWM data and enable leds for non-zero colors */
   rowsEnabled = 0;
@@ -135,27 +170,17 @@ static inline void pwmNextColumn() {
       cl = noColor;
     }
 
-    if (keyRow == 0) {
-        for (size_t i = 0; i < NUM_ROW * 3; i++) {  // clear rowTimes at start of each column
-            rowTimes[i] = 0;
-        }
-    }
-
     for (size_t colorIdx = 0; colorIdx < 3; colorIdx++) {
       const uint8_t ledRow = 3 * keyRow + colorIdx;
 
-      /* Compute adjustments */
-      uint8_t color = cl.pv[2 - colorIdx];
-
-      uint8_t cc = color_correction.pv[2 - colorIdx];
-      uint8_t ct = color_temperature.pv[2 - colorIdx];
-
-      if (cc > 0 && ct > 0) {
-        uint32_t work = (((uint32_t)cc) + 1) * (((uint32_t)ct) + 1) * 0xFF;
-        work /= 0x10000L;
-        uint8_t adj = work & 0xFF;
-        color = (color * adj) / 0xFF;
-      }
+      /* Apply the precomputed correction.
+       *
+       * (x + 1 + (x >> 8)) >> 8 equals x / 0xFF for every x a uint8_t pair
+       * can produce, so this drops the division without touching a single
+       * output value. */
+      const uint16_t work = (uint16_t)cl.pv[2 - colorIdx] *
+                            (uint16_t)colorAdjust[2 - colorIdx];
+      uint8_t color = (work + 1 + (work >> 8)) >> 8;
 
       /* >>2 to decrease the color resolution from 0-255 to 0-63 */
       color = color >> 2;
@@ -178,29 +203,40 @@ static inline void pwmNextColumn() {
 /*
  * Update lighting table as per animation
  */
-static inline void animationCallback() {
-  profiles[currentProfile].callback(ledColors);
+static THD_FUNCTION(animationThread, arg) {
+  (void)arg;
+  while (true) {
+    chBSemWait(&animationSem);
+    if (manualControl)
+      continue;
+    needToCallbackProfile = false;
+    profiles[currentProfile].callback(ledColors);
+  }
 }
 
 /*
  * mainCallback is called by GPT timer periodically
  * and is responsible for 2 things:
  * - software PWM
- * - calling animation callback for animated profiles
+ * - waking the thread that repaints animated profiles
  */
 void mainCallback(GPTDriver *_driver) {
   (void)_driver;
 
   pwmCounter += 1;
   if (pwmCounter < pwmCounterLimit) {
-    pwmRowDimmer();
+    /* Once every row has timed out there is nothing left to switch off, and
+     * the remaining ticks of the cycle have no work to do. */
+    if (rowsEnabled)
+      pwmRowDimmer();
     return;
   }
 
+  bool repaint = false;
+
   /* Update profile if required before starting new cycle */
   if (!manualControl && needToCallbackProfile) {
-    needToCallbackProfile = false;
-    profiles[currentProfile].callback(ledColors);
+    repaint = true;
   }
 
   /* Animation can be updated after each full column cycle. On
@@ -211,8 +247,19 @@ void mainCallback(GPTDriver *_driver) {
     animationTicks++;
     if (animationTicks >= animationSkipTicks) {
       animationTicks = 0;
-      animationCallback();
+      repaint = true;
     }
+  }
+
+  /* The profile callbacks walk all 70 keys and are far too long to run at
+   * this priority: this interrupt fires every 12.5us and cannot be preempted
+   * by the UART, so the time spent here is time the UART receive register is
+   * not being read. Hand the work to a thread instead. The semaphore is
+   * binary, so a frame we are too late for is dropped rather than queued. */
+  if (repaint) {
+    chSysLockFromISR();
+    chBSemSignalI(&animationSem);
+    chSysUnlockFromISR();
   }
 
   /* We start a new PWM column cycle. */
@@ -273,5 +320,11 @@ void matrixEnable(void) {
 /* Initialize matrix module */
 void matrixInit() {
   chMtxObjectInit(&mtx);
+  matrixUpdateColorAdjust();
+
+  chBSemObjectInit(&animationSem, true /* taken */);
+  chThdCreateStatic(waAnimation, sizeof(waAnimation), NORMALPRIO,
+                    animationThread, NULL);
+
   matrixEnabled = false;
 }
