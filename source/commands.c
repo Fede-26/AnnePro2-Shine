@@ -168,25 +168,40 @@ static THD_FUNCTION(blinkerFun, arg) {
 
 /* Prepare thread data and schedule a blinking thread */
 static inline void blinkKey(const message_t *msg) {
+  const uint8_t row = msg->payload[0];
+  const uint8_t col = msg->payload[1];
+
+  /* blinkerFun indexes ledMask with these, so they have to be checked before
+   * the thread is started. Every other handler taking a row/col got this
+   * guard when the out of bounds writes were fixed; this one was missed. */
+  if (row >= NUM_ROW || col >= NUM_COLUMN)
+    return;
+
   if (blinker.thread != NULL) {
     blinker.running = 0;
     chThdWait(blinker.thread);
     blinker.thread = NULL;
   }
 
-  blinker.row = msg->payload[0];
-  blinker.col = msg->payload[1];
+  blinker.row = row;
+  blinker.col = col;
   blinker.color.p.blue = msg->payload[2];
   blinker.color.p.green = msg->payload[3];
   blinker.color.p.red = msg->payload[4];
   blinker.color.p.alpha = msg->payload[5];
 
-  blinker.times = msg->payload[6] * 2;
+  /* One blink is an on and an off phase. Clamp rather than let the doubling
+   * wrap, which turned a request for 128 blinks into no blink at all. */
+  blinker.times = msg->payload[6] > 127 ? 255 : msg->payload[6] * 2;
   blinker.hundredths = msg->payload[7];
   blinker.running = 1;
 
   blinker.thread = chThdCreateFromHeap(NULL, THD_WORKING_AREA_SIZE(32),
                                        "blinker", NORMALPRIO, blinkerFun, NULL);
+  if (blinker.thread == NULL) {
+    /* Out of heap. Leave the key alone instead of pretending it blinks. */
+    blinker.running = 0;
+  }
 }
 
 static inline void setManual(const message_t *msg) {
