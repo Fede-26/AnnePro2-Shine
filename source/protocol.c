@@ -24,6 +24,7 @@ void protoInit(protocol_t *proto, void (*callback)(const message_t *)) {
   proto->previousId = 0;
   proto->callback = callback;
   proto->state = STATE_SYNC_1;
+  proto->payloadPosition = 0;
   proto->errors = 0;
 }
 
@@ -84,10 +85,6 @@ void protoConsume(protocol_t *proto, uint8_t byte) {
 
   case STATE_PAYLOAD_SIZE:
     proto->buffer.payloadSize = byte;
-    if (proto->buffer.payloadSize > MAX_PAYLOAD_SIZE) {
-      proto->buffer.payloadSize = MAX_PAYLOAD_SIZE;
-      proto->errors++;
-    }
     proto->payloadPosition = 0;
     if (proto->buffer.payloadSize == 0) {
       /* No payload - whole message received */
@@ -100,11 +97,21 @@ void protoConsume(protocol_t *proto, uint8_t byte) {
   case STATE_PAYLOAD:
     /* NOTE: This could be read with sdReadTimeout probably, but that breaks
      * abstraction */
-    proto->buffer.payload[proto->payloadPosition] = byte;
+    /* A size byte larger than our buffer only happens on a desynchronised
+     * stream. Swallow the announced length and drop the message instead of
+     * truncating it: truncating left the tail in the stream, where the next
+     * 0x7A 0x1D pair could turn random noise into a command. */
+    if (proto->payloadPosition < MAX_PAYLOAD_SIZE)
+      proto->buffer.payload[proto->payloadPosition] = byte;
     proto->payloadPosition++;
     if (proto->payloadPosition == proto->buffer.payloadSize) {
-      /* Payload read - message received */
-      messageReceived(proto);
+      if (proto->buffer.payloadSize <= MAX_PAYLOAD_SIZE) {
+        /* Payload read - message received */
+        messageReceived(proto);
+      } else {
+        proto->errors++;
+        proto->state = STATE_SYNC_1;
+      }
     }
     return;
   }
