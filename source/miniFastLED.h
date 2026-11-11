@@ -51,8 +51,10 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
     them if you're using direct RGB colors and want to dim them naively.
  */
 
-/* Dim a single value: R, G, B or a saturation component of the HSV color */
-static inline int8_t dimValue(uint8_t value) {
+/* Dim a single value: R, G, B or a saturation component of the HSV color.
+ * Returns uint8_t: the result is a colour component, and the old int8_t
+ * return type made every value above 127 negative on the way out. */
+static inline uint8_t dimValue(uint8_t value) {
   const uint8_t dimBy = ledIntensity * 30;
   if (dimBy > value)
     return 0;
